@@ -1,0 +1,205 @@
+---
+title: "Sunapee Lake Temperature Forecasting"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+
+    runtime: shiny
+    storyboard: true
+    
+
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(xgboost)
+library(zoo)
+library(shinybusy)
+library(plotly)
+```
+
+```{r}
+setwd('/Users/eric/Desktop/Fall22/CMDA4864/Final_Project') # USER CHANGE
+#remotes::install_github("dreamRs/shinybusy")
+
+```
+
+```{r}
+options(knitr.duplicate.label = "allow")
+
+```
+
+```{r}
+
+d <- readr::read_csv("https://s3.flare-forecast.org/targets/sunp/sunp-targets-insitu.csv")
+#d <- readr::read_csv("sunp-targets-insitu.csv")
+
+```
+
+```{r}
+# clean data from some years
+df = data.frame(d)
+
+df[['year']] <- strptime(df[['date']], format = "%Y-%m-%d")$year + 1900
+df[['dayofyear']] <- as.numeric( format(df[['date']], '%j'))
+
+df <- df %>%
+  filter(hour == 12) %>%
+  filter(year >= 2011) %>%
+  filter(year != 2017) %>%
+  filter(year != 2015) %>%
+  filter(dayofyear >= 162) %>%
+  filter(dayofyear <= 278) 
+
+```
+
+```{r}
+# Libraries
+library(ggplot2)
+library(dplyr)
+```
+
+
+
+
+Input {.sidebar data-width=250}
+================================
+```{r}
+
+selectInput(
+  "model", label = "Select model for forecasting:",
+  choices = c("day_of_year_weatherXGBM", "day_of_year_weather_previous7XGBM", "day_of_yearXGBM"), selected = "None"
+)
+
+
+dateInput("date1", "Reference Date:",
+          value = "2011-6-19",
+          datesdisabled = format(seq(as.Date("2013-01-01"), as.Date("2015-12-31"), by="days"), format="%Y-%m-%d"),
+          min = "2011-6-11",
+          max = "2019-9-11")
+
+actionButton("go","Generate graphs")
+tags$br()
+tags$br()
+uiOutput("button2")
+```
+
+```{r}
+add_busy_bar(color = "#FF0000")
+```
+
+```{r}
+gen_df <- function(model, day) {
+  # script for generating dataframe of predicting results
+  rmarkdown::render(input = paste('/Users/eric/Desktop/Fall22/CMDA4864/Final_Project/Model_Code/', model, '.Rmd', sep=''))
+  
+  ref_datetime <- as.Date(day) # USER CHANGES THIS DATE AS NEEDED
+  
+  
+  ref_year <- strptime(ref_datetime, format = "%Y-%m-%d")$year + 1900
+  ref_doy <-  as.numeric( format(ref_datetime, '%j'))
+  
+  # add predicted value to dataframe
+  tempWater["pred"] <- unlist(predTrain)
+  
+  # forecasted year:
+  temp <- tempWater[tempWater['year'] == ref_year, ]
+  start_row <- temp[temp['dayofyear'] >= ref_doy,]
+  end_row <- start_row[start_row['dayofyear'] <= ref_doy+35,]
+  origin_date <- paste(ref_year, '01', '01', sep="-")
+  end_row['datetime'] <- as.Date(end_row$dayofyear, origin = origin_date)
+  
+  final_df <- data.frame(reference_datetime = ref_datetime,
+                         model_id = "35DayofYear",
+                         site_id = "sunp",
+                         depth = end_row$depth,
+                         datetime = end_row$datetime,
+                         family = "ensemble",
+                         parameter = -1,
+                         variable = "Temperature",
+                         prediction = end_row$pred)
+ 
+}
+
+```
+
+```{r}
+# reactive button
+generate_df <- eventReactive(input$go, {
+  gen_df(input$model, input$date1)
+  
+})
+observeEvent(input$go, {
+  output$button2 <- renderUI({
+    margin_top <- input$dimension[2] * 0.8
+    actionButton("button2", label = "Save csv file", style = sprintf("position: absolute; top: %spx;", margin_top))
+  })
+})
+  
+  ```
+
+Temperature Prediction
+==============================================
+```{r}
+
+renderPlotly({
+  
+  generate_df() %>%
+    #wholeYear+
+    ggplot(aes(x=datetime, y = prediction, group=depth, color=depth), color = 'red') +
+    ggtitle(paste("35 Days Water Temperature Prediction Start from ", input$date1))+
+    theme(plot.title = element_text(lineheight=.8, face="bold"))+
+    xlab("Date") +
+    ylab("Water Temperature (Celcius)") +
+    labs(color="Depth (m)") +
+    geom_line()
+})
+
+```
+Temperature Prediction vs Historical Data
+==============================================
+```{r}
+renderPlotly({
+  
+  setwd('/Users/eric/Desktop/Fall22/CMDA4864') # USER CHANGE
+  input_year <- strptime(as.Date(input$date1), format = "%Y-%m-%d")$year + 1900
+  
+  
+  final_df <- generate_df()
+  final_df[['dayofyear']] <- strftime(final_df[['datetime']], format = "%j")
+  
+  don <- df %>%
+    filter(year==input_year) %>%
+    filter(hour==12)
+  
+  head <- head(final_df$dayofyear, n=1)
+  tail <- tail(final_df$dayofyear, n = 1)
+  don <- don %>%
+    filter(dayofyear <= tail )
+  
+  don[don$dayofyear %in% final_df$dayofyear & don$depth %in% final_df$depth, 'prediction'] <- 
+    final_df[final_df$dayofyear %in% don$dayofyear & final_df$depth %in% don$depth, 'prediction']
+  
+  filename <- paste0("Prediction_by_", input$model, ".csv")
+  write.csv(don,filename, row.names = FALSE)
+  don %>%
+    ggplot(aes(x=date, y=value, group=depth, color=depth)) +
+    geom_line(aes(x=date, y=prediction), linetype="dashed")+
+    ggtitle(paste("Prediction vs Actual Data")) +
+    theme(plot.title = element_text(lineheight=.8, face="bold"))+
+    xlab("Date") +
+    ylab("Water Temperature (Celcius)") +
+    labs(color="__  Actual\n---  Predicted\n\nDepth (m)") +
+    geom_line()
+  
+  
+})
+
+```
+
+
+
+

@@ -1,0 +1,298 @@
+---
+title: "Water Temperature Prediction"
+subtitle: "Day of Year, Depth, Previous Water Temperature, and Future Weather XGBoost Model"
+author: "Gregory Harrison, Claire Oberg"
+date: "Nov 28, 2022"
+output:
+  pdf_document:
+    highlight: haddock
+keep_tex: no
+number_sections: no
+html_document:
+  df_print: paged
+geometry: margin = 0.5in
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage{wrapfig}
+- \usepackage{float}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+- \usepackage{xcolor}
+editor_options:
+  chunk_output_type: console
+documentclass: article
+urlcolor: blue
+---
+  
+
+```{r setup, include=FALSE}
+# This is the setup chunk
+#  Here you can set global options for the entire document
+
+# Load libraries 
+library(knitr)
+library(dplyr)
+library(xgboost)
+library(zoo)
+
+# Although you can call functions from a library using the following notation
+#  without loading the entire library.
+knitr::opts_chunk$set(echo = TRUE, 
+                      comment = NA, # Required
+                      fig.path = "./figures/",  # Store all figures here in relative path (make the folder first)
+                      fig.align = "center",
+                      fig.width = 7,
+                      fig.height = 7,
+                      message = FALSE, # Turn off load messages
+                      warning = FALSE # Turn off warnings
+                      )
+```
+
+
+Read in Current Data from Lake Sunapee
+
+```{r}
+raw <- readr::read_csv("https://s3.flare-forecast.org/targets/sunp/sunp-targets-insitu.csv")
+```
+
+Convert Data to Dataframe
+
+```{r}
+df = data.frame(raw)
+
+# Generate year and day of year from the date column
+df[['year']] <- strptime(df[['date']], format = "%Y-%m-%d")$year + 1900
+df[['dayofyear']] <- as.numeric( format(df[['date']], '%j'))
+
+
+df <- df %>%
+  filter(hour == 12) %>%
+  filter(year >= 2011) %>%
+  filter(year != 2017) %>%
+  filter(year != 2015)
+
+dfPrev = select(df, c("depth", "year", "dayofyear", "value"))
+dfPrev["dayofyear"] = dfPrev["dayofyear"] + 7
+dfPrev["previousvalue"] = dfPrev["value"]
+dfPrev$value = NULL
+
+dfNew = merge(df, dfPrev, by=c("year","dayofyear", "depth"))
+```
+
+
+
+```{r}
+
+# Filter data according to our assumptions being:
+# only calculating at noon
+# years during and after 2011 and not including 2015 and 2017 for low amounts of data
+# Day of year range only between 162 and 278 
+df <- dfNew %>%
+  filter(dayofyear >= 162) %>%
+  filter(dayofyear <= 278) 
+```
+
+Weather:
+
+```{r}
+setwd("/Users/eric/Desktop/Fall22/CMDA4864/Final_Project")
+weather <- read.csv("all_data.csv", stringsAsFactors = T)
+head(weather)
+#summary(weather)
+#str(weather)
+#unique(weather[c("year")])
+
+# deal with datetime stuff
+weather$date <- as.Date(weather$datetime)
+weather[['dayofyear']] <- as.numeric( format(weather[['date']], '%j'))
+weather$year <- as.numeric(format(weather$date,'%Y'))
+
+# clean out the funky years etc, same way as cleaning water temps
+clean_weather <- weather %>%
+    filter(year >= 2011) #%>%
+    #filter(year != 2017) %>%
+    #filter(year != 2015) %>%
+    #filter(dayofyear >= 162) %>%
+    #filter(dayofyear <= 278)
+
+# cut out variables we won't use
+small_weather <- clean_weather %>% select(17,18,19,8,11,13,6)
+
+# calculate mins, maxes, and averages
+calculated_weather <- aggregate(x = small_weather$airTemperature_degC,      # Specify data column
+                         by = list(small_weather$date),                 # Specify group indicator
+                         FUN = mean)
+min_temp <- aggregate(x = small_weather$airTemperature_degC,      
+                         by = list(small_weather$date),              
+                         FUN = min)
+max_temp <- aggregate(x = small_weather$airTemperature_degC,      
+                         by = list(small_weather$date),              
+                         FUN = max)
+avg_rad <- aggregate(x = small_weather$radiationIncomingPAR_umolm2s,      
+                         by = list(small_weather$date),              
+                         FUN = mean)
+avg_windspeed <- aggregate(x = small_weather$windSpeedAverage_mps,      
+                         by = list(small_weather$date),              
+                         FUN = mean)
+avg_humidity <- aggregate(x = small_weather$relativeHumidity_perc,      
+                         by = list(small_weather$date),              
+                         FUN = mean)
+
+# create and merge data frame
+calculated_weather['min_airTemp'] <- min_temp$x
+calculated_weather['max_airTemp'] <- max_temp$x
+calculated_weather['avg_radian'] <- avg_rad$x
+calculated_weather['avg_windspeed'] <- avg_windspeed$x
+calculated_weather['avg_humidity'] <- avg_humidity$x
+colnames(calculated_weather)[2] = "avg_airTemp"
+colnames(calculated_weather)[1] = "date"
+```
+
+```{r}
+calculated_weather['year'] <- strptime(calculated_weather[['date']], format = "%Y-%m-%d")$year + 1900
+calculated_weather['dayofyear'] <- as.numeric( format(calculated_weather[['date']], '%j'))
+```
+
+
+```{r}
+avg_airTemp_35 = rollapply(calculated_weather$avg_airTemp, width = 35, by=1, FUN = mean, na.rm=TRUE, align="left")
+calculated_weather['avg_airTemp_35'] = append(rep(NA,34), avg_airTemp_35)
+
+min_airTemp_35 = rollapply(calculated_weather$min_airTemp, width = 35, by=1, FUN = mean, na.rm=TRUE, align="left")
+calculated_weather['min_airTemp_35'] = append(rep(NA,34), min_airTemp_35)
+
+max_airTemp_35 = rollapply(calculated_weather$max_airTemp, width = 35, by=1, FUN = mean, na.rm=TRUE, align="left")
+calculated_weather['max_airTemp_35'] = append(rep(NA,34), max_airTemp_35)
+
+avg_radian_35 = rollapply(calculated_weather$avg_radian, width = 35, by=1, FUN = mean, na.rm=TRUE, align="left")
+calculated_weather['avg_radian_35'] = append(rep(NA,34), avg_radian_35)
+```
+
+```{r}
+calculated_weather <- calculated_weather %>%
+    filter(year >= 2011) %>%
+    filter(year != 2017) %>%
+    filter(year != 2015) %>%
+    filter(dayofyear >= 162) %>%
+    filter(dayofyear <= 278)
+```
+
+
+Merge:
+
+```{r}
+merged <- merge(df, calculated_weather, by = 'date', all=TRUE)
+df = merged
+```
+
+```{r}
+#Remove the date, variable, and hour columns from our dataframe
+df$year = df$year.x
+df$dayofyear = df$dayofyear.x
+dfReduced = select(df, c("depth", "year", "dayofyear", "value", "avg_airTemp_35", 'min_airTemp_35', 'max_airTemp_35', 'avg_radian_35', 'previousvalue'))
+
+df = dfReduced
+
+df = df[!is.na(df$avg_airTemp_35)&!is.na(df$min_airTemp_35)&!is.na(df$max_airTemp_35)&!is.na(df$avg_radian_35), ]
+
+```
+
+
+
+Separate Training and Testing Sets
+
+```{r}
+# Separate our data into training (all years but 2013 and 2022) and 
+# testings (years 2013 and 2022)
+waterTrain = df[df$year != 2013 & df$year != 2022, ]
+waterTest = df[df$year == 2013 | df$year == 2022, ]
+
+# Drop Columns with NA's in them 
+waterTrain = na.omit(waterTrain)
+waterTest = na.omit(waterTest)
+tempWater = waterTrain
+```
+
+Convert Training and Testing set for XGBoost
+
+```{r}
+# Remove the year columns now that we've used them to seperate the date
+waterTrain$year = NULL
+waterTest$year = NULL
+
+# Generate our labels as the current water temperature
+train.label = waterTrain$value
+test.label = waterTest$value
+
+# Remove the temperature values from the input data 
+waterTrain$value = NULL
+waterTest$value = NULL
+
+# Convert the input data to a matrix for xgboost
+train.data = as.matrix(waterTrain)
+test.data = as.matrix(waterTest)
+```
+
+Train Model
+
+```{r}
+# Generate Training Input for XGBoost
+dtrain<-xgb.DMatrix(data = train.data, label = train.label)
+# Train our model
+bst <- xgboost(data = dtrain, max.depth = 10, eta = 0.1, nthread = 2, nrounds = 50, verbose = 1)
+# Product Predictions for our Testing Dataset
+pred <- predict(bst, test.data)
+# Calculate Mean Absolute Error 
+mean(abs(pred-test.label))
+```
+
+```{r}
+sqrt(mean((pred-test.label)^2))
+```
+
+Check error by depth 
+
+
+See how the model performs on the original training data. 
+
+```{r}
+predTrain <- predict(bst, train.data)
+mean(abs(predTrain-train.label))
+```
+
+Generate Some Graph of our data
+
+```{r}
+# Plot of Predicted vs. Actual Values
+plot(pred, test.label)
+abline(0,1)
+```
+
+```{r}
+# Plot of Predicted vs. Day of Year
+plot(pred, test.data[,2])
+```
+
+```{r}
+# Summary of Error
+summary(pred-test.label)
+```
+
+```{r}
+# Histogram of Error
+den<-density(pred-test.label)
+plot(den)
+```
+
+```{r}
+hist(pred-test.label, breaks=20)
+```
+
